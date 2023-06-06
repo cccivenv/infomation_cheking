@@ -1,0 +1,307 @@
+import sys
+from PyQt5 import QtCore, QtGui, QtWidgets
+
+from PyQt5.QtWidgets import QFileDialog, QMessageBox, QMainWindow, QVBoxLayout, QPushButton, QWidget, QTreeView
+import pandas as pd
+import numpy as np
+import sqlite3
+
+db = pd.read_csv('1your_file.csv')
+
+orders = pd.DataFrame()
+
+# Setup connection to SQLite database
+conn = sqlite3.connect('orders.db')
+cursor = conn.cursor()
+treeview = None
+evg_base = 1000000
+plt_base = 100000
+
+
+def process_orders(orders, evg_base, plt_base):
+    new_data_list = []
+    summary_data_list = []
+    max_boxes = 0
+    for index, order in orders.iterrows():
+        item = order['ITEM']
+        po = order['PO']
+        order_qty = order['ORDER QTY']
+        item_info = db[db['ITEM'] == item]
+        if len(item_info) == 0:
+            print(f'No such ITEM: {item}')
+            continue
+        item_info = item_info.iloc[0]
+        cartons = order_qty // item_info['HSU/Carton']
+        leftover_hsu = order_qty % item_info['HSU/Carton']
+        hsu_carton = item_info['Carton/Pallet']
+        full_pallets = cartons // hsu_carton
+        leftover_cartons = cartons % hsu_carton
+        max_boxes = max(max_boxes, hsu_carton)
+
+        qty_hsu = item_info['Qty/HSU']
+        hsu = order_qty
+        carton_pallet = item_info['Carton/Pallet']
+        pallet = cartons // carton_pallet
+        carton_type = item_info['Carton-Type']
+        pallet_weight = 18
+        total_pallet_weight = pallet_weight * pallet
+        qty = order_qty * qty_hsu
+
+        summary_row = {
+            "PO": po,
+            "ITEM": item,
+            "QTY": qty,
+            "QTY/HSU": qty_hsu,
+            "HSU": hsu,
+            "HSU/Carton": item_info['HSU/Carton'],
+            "Carton": cartons,
+            "Carton/Pallet": carton_pallet,
+            "Pallet": pallet,
+            "Carton_type": carton_type,
+            "Pallet-weight": pallet_weight,
+            "棧板總重量": total_pallet_weight,
+            "每箱淨重(KG)": item_info['N.W'],  # assuming N.W is the column name in db
+            "每箱毛重(KG)": item_info['G.W'],  # assuming G.W is the column name in db
+            "產品總重量": item_info['G.W'] * cartons
+        }
+        summary_data_list.append(summary_row)
+
+        for i in range(full_pallets):
+            new_row = {'PO': po, 'ITEM': item, 'PLT': 'EVG' + str(plt_base).zfill(6)}
+            plt_base += 1
+            for j in range(hsu_carton):
+                new_row[str(j)] = 'EVG' + str(evg_base).zfill(7)
+                evg_base += 1
+            new_data_list.append(new_row)
+
+        if leftover_cartons > 0:
+            new_row = {'PO': po, 'ITEM': item, 'PLT': 'Incomplete Pallet'}
+            for j in range(leftover_cartons):
+                new_row[str(j)] = 'EVG' + str(evg_base).zfill(7)
+                evg_base += 1
+            for k in range(leftover_cartons, hsu_carton):
+                new_row[str(k)] = np.nan
+            new_data_list.append(new_row)
+
+        if leftover_hsu > 0:
+            new_row = {'PO': po, 'ITEM': item, 'PLT': 'Incomplete Carton', '0': 'EVG' + str(evg_base).zfill(7)}
+            for k in range(1, hsu_carton):
+                new_row[str(k)] = np.nan
+            evg_base += 1
+            new_data_list.append(new_row)
+
+    summary_data = pd.DataFrame(summary_data_list)
+    new_data = pd.DataFrame(new_data_list)
+
+    new_data.columns = ['PO', 'ITEM', 'PLT'] + [str(i) for i in range(1, max_boxes + 1)]
+
+    return new_data, summary_data
+
+
+class ConfirmationDialog(QtWidgets.QDialog):
+    def __init__(self, data):
+        super(ConfirmationDialog, self).__init__()
+
+        self.setWindowTitle("Confirmation")
+        self.resize(600, 400)
+
+        self.treeview = QTreeView()
+        self.treeview.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+
+        self.model = QtGui.QStandardItemModel()
+        self.model.setHorizontalHeaderLabels(data.columns)
+
+        for index, row in data.iterrows():
+            items = [QtGui.QStandardItem(str(value)) for value in row]
+            self.model.appendRow(items)
+
+        self.treeview.setModel(self.model)
+
+        confirm_button = QtWidgets.QPushButton("Confirm")
+        confirm_button.clicked.connect(self.accept)
+
+        cancel_button = QtWidgets.QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+
+        button_layout = QtWidgets.QHBoxLayout()
+        button_layout.addWidget(confirm_button)
+        button_layout.addWidget(cancel_button)
+
+        main_layout = QtWidgets.QVBoxLayout()
+        main_layout.addWidget(self.treeview)
+        main_layout.addLayout(button_layout)
+
+        self.setLayout(main_layout)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super(MainWindow, self).__init__()
+
+        evg_label = QtWidgets.QLabel("Starting EVG:")
+        self.evg_entry = QtWidgets.QLineEdit()
+        plt_label = QtWidgets.QLabel("Starting PLT:")
+        self.plt_entry = QtWidgets.QLineEdit()
+        po_label = QtWidgets.QLabel("PO:")
+        self.po_entry = QtWidgets.QLineEdit()
+        port_label = QtWidgets.QLabel("Port:")
+        self.port_entry = QtWidgets.QLineEdit()
+
+        import_button = QtWidgets.QPushButton("Import CSV")
+        import_button.clicked.connect(self.import_csv_data)
+
+        open_db_button = QtWidgets.QPushButton("Open Database")
+        open_db_button.clicked.connect(self.open_database)
+
+        self.frame = QtWidgets.QFrame()
+        self.frame_layout = QVBoxLayout()
+        self.frame.setLayout(self.frame_layout)
+
+        self.treeview = QTreeView()
+        self.treeview.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+
+        handle_button = QtWidgets.QPushButton("Handle selected rows")
+        handle_button.clicked.connect(self.handle_selected_rows)
+
+        export_button = QtWidgets.QPushButton("Export selected rows")
+        export_button.clicked.connect(self.export_selected_rows)
+
+        self.frame_layout.addWidget(evg_label)
+        self.frame_layout.addWidget(self.evg_entry)
+        self.frame_layout.addWidget(plt_label)
+        self.frame_layout.addWidget(self.plt_entry)
+        self.frame_layout.addWidget(po_label)
+        self.frame_layout.addWidget(self.po_entry)
+        self.frame_layout.addWidget(port_label)
+        self.frame_layout.addWidget(import_button)
+        self.frame_layout.addWidget(open_db_button)
+        self.frame_layout.addWidget(self.treeview)
+        self.frame_layout.addWidget(handle_button)
+        self.frame_layout.addWidget(export_button)
+        delete_db_button = QtWidgets.QPushButton("Delete Database")
+        delete_db_button.clicked.connect(self.delete_database)
+        self.frame_layout.addWidget(delete_db_button)
+
+        self.setCentralWidget(self.frame)
+
+        self.show_data_from_database()
+
+    def delete_database(self):
+        reply = QMessageBox.question(self, "Delete Confirmation", "Are you sure you want to delete the database?",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            cursor.execute("DELETE FROM orders")
+            conn.commit()
+            QMessageBox.information(self, "Database Deleted", "Database content has been deleted.")
+
+    def import_csv_data(self):
+        csv_file_path, _ = QFileDialog.getOpenFileName(self, "Select CSV File")
+        if csv_file_path:
+            global orders
+            orders = pd.read_csv(csv_file_path)
+
+            new_data, summary_data = process_orders(orders, evg_base, plt_base)
+
+            new_data.columns = [col.replace(' ', '_').replace('-', '_') for col in new_data.columns]
+
+            confirmation_dialog = ConfirmationDialog(new_data)
+            result = confirmation_dialog.exec_()
+
+            if result == QtWidgets.QDialog.Accepted:
+                new_data.to_sql('orders', conn, if_exists='replace', index=False)
+                self.show_data_from_database()
+                QMessageBox.information(self, "Data Loaded", "Data has been successfully loaded into the database.")
+            else:
+                QMessageBox.information(self, "Data Not Loaded", "Data has not been loaded into the database.")
+
+    def open_database(self):
+        conn = sqlite3.connect('orders.db')
+        cursor = conn.cursor()
+
+        # 执行查询语句
+        cursor.execute("SELECT * FROM orders")
+
+        # 获取查询结果
+        result = cursor.fetchall()
+
+        # 打印查询结果
+        for row in result:
+            print(row)
+
+        # 关闭数据库连接
+        cursor.close()
+        conn.close()
+
+    def show_data(self, data):
+        self.model = QtGui.QStandardItemModel()
+        self.model.setHorizontalHeaderLabels(data.columns)
+
+        for index, row in data.iterrows():
+            items = [QtGui.QStandardItem(str(value)) for value in row]
+            self.model.appendRow(items)
+
+        self.treeview.setModel(self.model)
+
+    def show_data_from_database(self):
+        # Execute query to fetch data from the database
+        cursor.execute("SELECT * FROM orders")
+        result = cursor.fetchall()
+
+        # Convert the query result to a pandas DataFrame
+        columns = [description[0] for description in cursor.description]
+        data = pd.DataFrame(result, columns=columns)
+
+        # Display the data in the treeview
+        self.show_data(data)
+
+    def export_selected_rows(self):
+        selected_indexes = self.treeview.selectedIndexes()
+        if len(selected_indexes) == 0:
+            QMessageBox.warning(self, "No Selection", "No rows selected.")
+            return
+
+        selected_rows = set()
+        for index in selected_indexes:
+            if index.column() == 0:  # Only consider the first column (PO column)
+                selected_rows.add(index.row())
+
+        if len(selected_rows) == 0:
+            QMessageBox.warning(self, "No Selection", "No rows selected.")
+            return
+
+        selected_data = orders.iloc[list(selected_rows)]
+        new_data, summary_data = process_orders(selected_data, evg_base, plt_base)
+
+        excel_file_path, _ = QFileDialog.getSaveFileName(self, "Save Excel File", filter="Excel Files (*.xlsx)")
+        if excel_file_path:
+            with pd.ExcelWriter(excel_file_path) as writer:
+                new_data.to_excel(writer, sheet_name='New Data', index=False)
+                summary_data.to_excel(writer, sheet_name='Summary Data', index=False)
+
+            QMessageBox.information(self, "Export Successful", f"Exported data to {excel_file_path}")
+
+    def handle_selected_rows(self):
+        selected_indexes = self.treeview.selectedIndexes()
+        if len(selected_indexes) == 0:
+            QMessageBox.warning(self, "No Selection", "No rows selected.")
+            return
+
+        selected_rows = []
+        for index in selected_indexes:
+            if index.column() == 0:  # Only consider the first column (PO column)
+                selected_rows.append(self.model.itemFromIndex(index).text())
+
+        if len(selected_rows) == 0:
+            QMessageBox.warning(self, "No Selection", "No rows selected.")
+            return
+
+        # Handle the selected rows here
+        print(selected_rows)
+
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    main_window = MainWindow()
+    main_window.show()
+    sys.exit(app.exec_())
+ 重新寫一次 使用的步驟就是打開app 顯示目前資料庫內容，如果要import 資料則是import csv以後出現一個視窗可以確認是不是確定要import的內容，如果是就點選正確，資料庫內就是new_data的資料，接著可以在資料庫視窗內選取要export的選項，選取好了以後點擊export ，資料按照選取的選項導出summary  以及一個選取的那一行的內容。接著資料庫會刪除導出的那一行資料，如果選擇多行則刪除多行，視選取的情況而定。 所以並不需要重新算new_data.
